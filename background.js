@@ -376,24 +376,15 @@ browser.storage.onChanged.addListener(async (changes, areaName) => {
   }
 });
 
-// Listen for session restore if available
-if (browser.sessions && browser.sessions.onRestored) {
-  browser.sessions.onRestored.addListener(async (sessionInfos) => {
-    log('Session restored, checking mute states...');
-    // Wait a bit for tabs to stabilize
-    setTimeout(() => applyMuteStatesToAllTabs(), 1000);
-  });
-}
-
-// Also listen for individual tab restoration
+// Listen for individual tab creation (including restored tabs)
 browser.tabs.onCreated.addListener(async (tab) => {
-  // Check if this is a restored tab that needs muting
-  if (tab.url && tab.sessionId) {
+  // Check if this tab needs muting
+  if (tab.url) {
     const domain = getDomain(tab.url);
     if (domain) {
       const shouldMute = await isDomainMuted(domain);
       if (shouldMute) {
-        log(`Restored tab ${tab.id} needs muting`);
+        log(`New/restored tab ${tab.id} needs muting`);
         // Give the tab a moment to fully initialize
         setTimeout(() => updateTabMuteState(tab.id, true), 500);
       }
