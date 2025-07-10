@@ -119,7 +119,7 @@ async function unmuteDomain(domain) {
 }
 
 // Safely update tab mute state
-async function updateTabMuteState(tabId, muted) {
+async function updateTabMuteState(tabId, muted, retryCount = 0) {
   try {
     // Verify tab still exists
     const tab = await browser.tabs.get(tabId).catch(() => null);
@@ -130,6 +130,16 @@ async function updateTabMuteState(tabId, muted) {
       return true;
     }
     
+    // Check if tab is in a state where it can be muted
+    // Some tabs may not be ready immediately after restore
+    if (tab.status === 'unloaded' || tab.discarded) {
+      log(`Tab ${tabId} not ready for muting (${tab.status}), will retry`);
+      if (retryCount < 3) {
+        setTimeout(() => updateTabMuteState(tabId, muted, retryCount + 1), 500);
+      }
+      return false;
+    }
+    
     await browser.tabs.update(tabId, { muted });
     return true;
   } catch (e) {
@@ -137,6 +147,12 @@ async function updateTabMuteState(tabId, muted) {
     if (!e.message?.includes('No tab with id')) {
       log(`Failed to update tab mute state: ${tabId}`, e);
     }
+    
+    // Retry for certain errors
+    if (retryCount < 3 && e.message?.includes('Invalid tab ID')) {
+      setTimeout(() => updateTabMuteState(tabId, muted, retryCount + 1), 500);
+    }
+    
     return false;
   }
 }
@@ -221,18 +237,31 @@ async function muteAllTabsForDomain(domain, mute) {
 // Check and apply mute status when a tab is updated
 browser.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
   try {
-    // Only check when URL changes or page loads
-    if (!changeInfo.url && changeInfo.status !== 'loading' && changeInfo.status !== 'complete') {
-      return;
+    // Check on URL change
+    if (changeInfo.url) {
+      if (!tab.url) return;
+      
+      const domain = getDomain(tab.url);
+      if (!domain) return;
+      
+      const shouldMute = await isDomainMuted(domain);
+      await updateTabMuteState(tabId, shouldMute);
     }
     
-    if (!tab.url) return;
-    
-    const domain = getDomain(tab.url);
-    if (!domain) return;
-    
-    const shouldMute = await isDomainMuted(domain);
-    await updateTabMuteState(tabId, shouldMute);
+    // Also check when tab completes loading (catches session restore)
+    if (changeInfo.status === 'complete' && tab.url) {
+      const domain = getDomain(tab.url);
+      if (!domain) return;
+      
+      const shouldMute = await isDomainMuted(domain);
+      const currentlyMuted = tab.mutedInfo?.muted || false;
+      
+      // If state doesn't match what it should be, fix it
+      if (shouldMute !== currentlyMuted) {
+        log(`Tab ${tabId} loaded with wrong mute state, fixing...`);
+        await updateTabMuteState(tabId, shouldMute);
+      }
+    }
   } catch (e) {
     log('Error in tab update listener', e);
   }
@@ -270,34 +299,69 @@ async function applyMuteStatesToAllTabs() {
       getMutedDomains()
     ]);
     
-    if (mutedDomains.length === 0) return;
+    if (mutedDomains.length === 0) return 0;
     
+    let unmutedCount = 0;
     const promises = [];
+    
     for (const tab of tabs) {
       if (!tab.url) continue;
       
       const domain = getDomain(tab.url);
       if (domain && mutedDomains.includes(domain)) {
-        promises.push(updateTabMuteState(tab.id, true));
+        // Check if tab should be muted but isn't
+        if (!tab.mutedInfo || !tab.mutedInfo.muted) {
+          unmutedCount++;
+          promises.push(updateTabMuteState(tab.id, true));
+        }
       }
     }
     
     await Promise.allSettled(promises);
-    log(`Applied mute states to ${promises.length} tabs`);
+    log(`Applied mute states to ${promises.length} tabs (${unmutedCount} were unmuted)`);
+    return unmutedCount;
   } catch (e) {
     log('Error applying mute states to tabs', e);
+    return 0;
+  }
+}
+
+// Delayed initialization to handle session restore race conditions
+async function delayedStartupCheck(attemptNumber = 1) {
+  const maxAttempts = 5;
+  const delay = Math.min(1000 * attemptNumber, 5000); // Exponential backoff up to 5 seconds
+  
+  log(`Startup check attempt ${attemptNumber}/${maxAttempts} (${delay}ms delay)`);
+  
+  await new Promise(resolve => setTimeout(resolve, delay));
+  
+  const unmutedCount = await applyMuteStatesToAllTabs();
+  
+  // If we found tabs that should be muted but weren't, try again
+  if (unmutedCount > 0 && attemptNumber < maxAttempts) {
+    log(`Found ${unmutedCount} unmuted tabs that should be muted, retrying...`);
+    delayedStartupCheck(attemptNumber + 1);
   }
 }
 
 // Check all existing tabs on startup
 browser.runtime.onStartup.addListener(() => {
+  log('Extension starting up...');
+  // Immediate check
   applyMuteStatesToAllTabs();
+  // Delayed check to catch session-restored tabs
+  delayedStartupCheck();
 });
 
 // Check tabs when extension is installed/updated
 browser.runtime.onInstalled.addListener((details) => {
   log(`Extension ${details.reason}: ${details.previousVersion || 'first install'}`);
   applyMuteStatesToAllTabs();
+  
+  // Also do delayed check on install/update
+  if (details.reason === 'install' || details.reason === 'update') {
+    delayedStartupCheck();
+  }
 });
 
 // Handle storage changes (in case of sync or external changes)
@@ -309,6 +373,31 @@ browser.storage.onChanged.addListener(async (changes, areaName) => {
     }
   } catch (e) {
     log('Error handling storage change', e);
+  }
+});
+
+// Listen for session restore if available
+if (browser.sessions && browser.sessions.onRestored) {
+  browser.sessions.onRestored.addListener(async (sessionInfos) => {
+    log('Session restored, checking mute states...');
+    // Wait a bit for tabs to stabilize
+    setTimeout(() => applyMuteStatesToAllTabs(), 1000);
+  });
+}
+
+// Also listen for individual tab restoration
+browser.tabs.onCreated.addListener(async (tab) => {
+  // Check if this is a restored tab that needs muting
+  if (tab.url && tab.sessionId) {
+    const domain = getDomain(tab.url);
+    if (domain) {
+      const shouldMute = await isDomainMuted(domain);
+      if (shouldMute) {
+        log(`Restored tab ${tab.id} needs muting`);
+        // Give the tab a moment to fully initialize
+        setTimeout(() => updateTabMuteState(tab.id, true), 500);
+      }
+    }
   }
 });
 
