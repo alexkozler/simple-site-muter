@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Simple Site Muter",
-  "version": "1.1",
+  "version": "1.2",
   "description": "Mute websites by top-level-domain with a simple tab right-click",
   "homepage_url": "https://github.com/alexkozler/simple-site-muter",
   "icons": {
