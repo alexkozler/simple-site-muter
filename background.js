@@ -118,6 +118,14 @@ async function unmuteDomain(domain) {
   }
 }
 
+// True if this extension (not the user or another extension) set the tab's current mute
+function isMutedByThisExtension(tab) {
+  const info = tab && tab.mutedInfo;
+  return !!(info && info.muted &&
+    info.reason === 'extension' &&
+    info.extensionId === browser.runtime.id);
+}
+
 // Safely update tab mute state
 async function updateTabMuteState(tabId, muted, retryCount = 0) {
   try {
@@ -245,7 +253,10 @@ browser.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
       if (!domain) return;
       
       const shouldMute = await isDomainMuted(domain);
-      await updateTabMuteState(tabId, shouldMute);
+      // Only auto-unmute tabs this extension muted; keep mutes the user set themselves
+      if (shouldMute || isMutedByThisExtension(tab)) {
+        await updateTabMuteState(tabId, shouldMute);
+      }
     }
     
     // Also check when tab completes loading (catches session restore)
@@ -257,7 +268,8 @@ browser.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
       const currentlyMuted = tab.mutedInfo?.muted || false;
       
       // If state doesn't match what it should be, fix it
-      if (shouldMute !== currentlyMuted) {
+      // (but never unmute a tab the user muted themselves)
+      if (shouldMute !== currentlyMuted && (shouldMute || isMutedByThisExtension(tab))) {
         log(`Tab ${tabId} loaded with wrong mute state, fixing...`);
         await updateTabMuteState(tabId, shouldMute);
       }
